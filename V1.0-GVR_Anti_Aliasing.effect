@@ -1,0 +1,134 @@
+// --- Studio GVR Anti-Aliasing ---
+
+// Pipeline: Source-Aware Edge Detection -> Vector Search -> Geometric Reconstruction
+
+// --- OBS UNIFORMS ---
+uniform float4x4 ViewProj;
+uniform texture2d image;
+uniform float2 uv_pixel_interval;
+
+uniform string info_aa<
+    string name = " ";
+    string widget_type = "info";
+> = "GEOMETRIC VECTOR RECONSTRUCTION (GVR)";
+
+// --- GROUP: GEOMETRIC VECTOR RECONSTRUCTION (GVR AA) ---
+uniform bool enable_gvr <
+    string name = "Enable GVR AA";
+> = true;
+
+uniform int gvr_samples <
+    string name = "  Vector Search Quality";
+    string widget_type = "select";
+    int option_0_value = 8;  string option_0_label = "8 Taps (Fast)";
+    int option_1_value = 16; string option_1_label = "16 Taps (Medium)";
+    int option_2_value = 32; string option_2_label = "32 Taps (High)";
+> = 16;
+
+uniform float gvr_multiplier <
+    string name = "  Source Awareness (Multiplier)";
+    string tooltip = "Match this to your (Canvas Width / Source Width).\n2.0 for 1080p Source on 4K Canvas.";
+    float minimum = 1.0; float maximum = 8.0; float step = 0.01;
+> = 2.0;
+
+uniform float gvr_threshold <
+    string name = "  Edge Sensitivity";
+    float minimum = 0.01; float maximum = 0.5; float step = 0.01;
+> = 0.2;
+
+uniform float gvr_sharpness <
+    string name = "  Reconstruction Sharpness";
+    float minimum = 0.0; float maximum = 2.0; float step = 0.05;
+> = 0.02;
+
+uniform string divider_line<
+    string name = " ";
+    string widget_type = "info";
+> = "";
+
+// --- DIAGNOSTICS ---
+uniform int debug_mode <
+    string name = "Debug View";
+    string widget_type = "select";
+    int option_0_value = 0; string option_0_label = "Off (Final Output)";
+    int option_1_value = 1; string option_1_label = "Edge Detection (Heatmap)";
+> = 0;
+
+// --- INTERNALS ---
+sampler_state def_sampler { Filter = Linear; AddressU = Clamp; AddressV = Clamp; };
+struct VertData { float4 pos : POSITION; float2 uv : TEXCOORD0; };
+
+VertData VSDefault(VertData v_in) {
+    VertData v_out; v_out.pos = mul(float4(v_in.pos.xyz, 1.0), ViewProj); v_out.uv  = v_in.uv; return v_out;
+}
+
+float getLuma(float3 rgb) { return dot(rgb, float3(0.299, 0.587, 0.114)); }
+
+float4 PS_GVR_AA(VertData v_in) : TARGET {
+    float4 raw_center = image.Sample(def_sampler, v_in.uv);
+    float3 processed_rgb = raw_center.rgb;
+    
+    // Debug accumulator
+    float edge_intensity = 0.0;
+
+    if (enable_gvr) {
+        // We define the 'Source Texel' to bridge the gap between source res and canvas res
+        float2 s_texel = uv_pixel_interval * gvr_multiplier;
+        float3 c = processed_rgb;
+
+        // 1. SOURCE-AWARE SOBEL GRADIENT
+        // Sample at the source-pixel distance to find the true geometric slope
+        float tl = getLuma(image.Sample(def_sampler, v_in.uv + float2(-s_texel.x, -s_texel.y)).rgb);
+        float tr = getLuma(image.Sample(def_sampler, v_in.uv + float2(s_texel.x, -s_texel.y)).rgb);
+        float bl = getLuma(image.Sample(def_sampler, v_in.uv + float2(-s_texel.x, s_texel.y)).rgb);
+        float br = getLuma(image.Sample(def_sampler, v_in.uv + float2(s_texel.x, s_texel.y)).rgb);
+        float l  = getLuma(image.Sample(def_sampler, v_in.uv + float2(-s_texel.x, 0)).rgb);
+        float r  = getLuma(image.Sample(def_sampler, v_in.uv + float2(s_texel.x, 0)).rgb);
+        float t  = getLuma(image.Sample(def_sampler, v_in.uv + float2(0, -s_texel.y)).rgb);
+        float b  = getLuma(image.Sample(def_sampler, v_in.uv + float2(0, s_texel.y)).rgb);
+
+        float Gx = (tl + 2.0*l + bl) - (tr + 2.0*r + br);
+        float Gy = (tl + 2.0*t + tr) - (bl + 2.0*b + br);
+        float gradient_mag = sqrt(Gx*Gx + Gy*Gy);
+        
+        edge_intensity = gradient_mag; // For debug
+
+        if (gradient_mag > gvr_threshold) {
+            // 2. VECTOR CALCULATION (Direction of the edge)
+            float2 dir_p = float2(-Gy, Gx) / (gradient_mag + 0.001);
+
+            // 3. SOURCE-AWARE VECTOR SEARCH
+            float3 acc = c;
+            float total_w = 1.0;
+            
+            [loop]
+            for (int i = 1; i <= gvr_samples; i++) {
+                float weight = 1.0 - (float)i / (float)gvr_samples;
+                
+                // The search 'walks' along the source vector steps
+                // using the canvas-native pixels for sub-pixel sampling.
+                float2 offset = dir_p * s_texel * (float)i * gvr_sharpness;
+                
+                acc += image.Sample(def_sampler, v_in.uv + offset).rgb * weight;
+                acc += image.Sample(def_sampler, v_in.uv - offset).rgb * weight;
+                total_w += 2.0 * weight;
+            }
+
+            // 4. GEOMETRIC RECONSTRUCTION
+            float3 gvr_resolve = acc / total_w;
+            float mix_factor = saturate(gradient_mag * 2.0);
+            
+            // This 'melts' the source-jaggies into smooth vectors
+            processed_rgb = lerp(c, gvr_resolve, mix_factor);
+        }
+    }
+
+    // --- DEBUG ---
+    if (debug_mode == 1) return float4(edge_intensity * 4.0, edge_intensity * 2.0, 0.0, 1.0);
+
+    return float4(processed_rgb, raw_center.a);
+}
+
+technique Draw {
+    pass { vertex_shader = VSDefault(v_in); pixel_shader = PS_GVR_AA(v_in); }
+}

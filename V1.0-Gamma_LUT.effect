@@ -1,0 +1,60 @@
+// --- Studio Gamma Transform ---
+// Purpose: Procedural LUT for Gamma workspace conversion.
+// Math: V_out = V_in ^ (Target_Gamma / Source_Gamma)
+
+// --- OBS UNIFORMS ---
+uniform float4x4 ViewProj;
+uniform texture2d image;
+
+uniform string info_gamma<
+    string name = " ";
+    string widget_type = "info";
+> = "GAMMA WORKSPACE CONVERSION";
+
+uniform float gamma_source <
+    string name = "Source Gamma (Input)";
+    float minimum = 0.1; float maximum = 5.0; float step = 0.01;
+> = 2.2;
+
+uniform float gamma_target <
+    string name = "Target Gamma (Output)";
+    float minimum = 0.1; float maximum = 5.0; float step = 0.01;
+> = 2.4;
+
+uniform bool enable_clamping <
+    string name = "Safe Clipping (Prevent Overshoot)";
+> = true;
+
+// --- INTERNALS ---
+sampler_state def_sampler { Filter = Linear; AddressU = Clamp; AddressV = Clamp; };
+struct VertData { float4 pos : POSITION; float2 uv : TEXCOORD0; };
+
+VertData VSDefault(VertData v_in) {
+    VertData v_out; v_out.pos = mul(float4(v_in.pos.xyz, 1.0), ViewProj); v_out.uv  = v_in.uv; return v_out;
+}
+
+float4 PS_GammaTransform(VertData v_in) : TARGET {
+    float4 rgba = image.Sample(def_sampler, v_in.uv);
+    float3 rgb = rgba.rgb;
+
+    // Calculate the conversion ratio
+    // For 2.2 to 2.4, the exponent is ~1.0909
+    float exponent = gamma_target / gamma_source;
+
+    // Apply the transformation
+    // We use max(0, rgb) to prevent NaN errors on negative color values (rare in SDR)
+    rgb = pow(max(0.0, rgb), exponent);
+
+    if (enable_clamping) {
+        rgb = saturate(rgb);
+    }
+
+    return float4(rgb, rgba.a);
+}
+
+technique Draw {
+    pass { 
+        vertex_shader = VSDefault(v_in); 
+        pixel_shader = PS_GammaTransform(v_in); 
+    }
+}

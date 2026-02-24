@@ -1,0 +1,139 @@
+// --- Studio Scaling Reconstruction ---
+// Extracted from V1.1-Studio-Master-Optimizer
+// Pipeline: Multi-Tap Sampling -> Range-Limited Reconstruction -> Anti-Ringing Clamp
+
+// --- OBS UNIFORMS ---
+uniform float4x4 ViewProj;
+uniform texture2d image;
+uniform float2 uv_pixel_interval;
+
+uniform string info_usr<
+    string name = " ";
+    string widget_type = "info";
+> = "SCALING ENGINE (UPSCALING)";
+
+uniform string upscale_pro_tip <
+    string name = "  [ PRO-TIP: Upscaling ]";
+    string widget_type = "info";
+> = "1. Right-click Source > Scale Filtering > 'Point' or 'Disable'. \n2. Place Source in Group. \n3. Apply filter TO THE GROUP. \n4. Multiplier = (Canvas / Source). \nEx: 4K Canvas / 1080p Source = 2.0x Multiplier.";
+
+// --- GROUP: UPSCALING ENGINE ---
+uniform bool enable_upscale <
+    string name = "Enable Scale Processing";
+> = true;
+
+uniform int upscale_quality <
+    string name = "  Processing Quality";
+    string widget_type = "select";
+    int option_0_value = 0; string option_0_label = "5 Taps (Fast)";
+    int option_1_value = 1; string option_1_label = "9 Taps (Low)";
+    int option_2_value = 2; string option_2_label = "16 Taps (Medium)";
+    int option_3_value = 3; string option_3_label = "25 Taps (High)";
+> = 2;
+
+uniform float upscale_factor <
+    string name = "  Upscale Multiplier (Source Awareness)";
+    float minimum = 1.0; float maximum = 8.0; float step = 0.01; 
+> = 2.0;
+
+uniform float upscale_smoothness <
+    string name = "  Smoothness (Interpolation)";
+    float minimum = 0.0; float maximum = 10.0; float step = 0.01;
+> = 0.5;
+
+uniform string divider_line<
+    string name = " ";
+    string widget_type = "info";
+> = "";
+
+// --- DIAGNOSTICS ---
+uniform int debug_mode <
+    string name = "Debug View";
+    string widget_type = "select";
+    int option_0_value = 0; string option_0_label = "Off (Final Output)";
+    int option_1_value = 1; string option_1_label = "Show Interpolation Delta";
+> = 0;
+
+// --- INTERNALS ---
+sampler_state def_sampler { Filter = Linear; AddressU = Clamp; AddressV = Clamp; };
+struct VertData { float4 pos : POSITION; float2 uv : TEXCOORD0; };
+
+VertData VSDefault(VertData v_in) {
+    VertData v_out; v_out.pos = mul(float4(v_in.pos.xyz, 1.0), ViewProj); v_out.uv  = v_in.uv; return v_out;
+}
+
+float getLuma(float3 rgb) { return dot(rgb, float3(0.299, 0.587, 0.114)); }
+
+float4 PS_Scaling(VertData v_in) : TARGET {
+    float4 raw_center = image.Sample(def_sampler, v_in.uv);
+    float3 processed_rgb = raw_center.rgb;
+    float3 pre_scale_rgb = raw_center.rgb;
+
+    if (enable_upscale) {
+        float2 texel = uv_pixel_interval;
+        float3 current_work = processed_rgb;
+        float m_luma = getLuma(current_work);
+        
+        // Anti-artifact range bounds
+        float3 n_min = current_work;
+        float3 n_max = current_work;
+        
+        float sigma_color = max(0.001, upscale_smoothness * 0.2); 
+        float sigma_spatial = 1.0 + (upscale_smoothness * 0.2); 
+        
+        float3 acc = float3(0,0,0);
+        float total_w = 0;
+        float2 stride = texel * (upscale_factor * 0.5);
+
+        [unroll]
+        for (int x = -2; x <= 2; x++) {
+            [unroll]
+            for (int y = -2; y <= 2; y++) {
+                // TAPS LOGIC:
+                // Fast (5-Tap): Plus Shape
+                if (upscale_quality == 0 && (abs(x) + abs(y) > 1)) continue;
+                // Natural (9-Tap): 3x3 center
+                if (upscale_quality == 1 && (abs(x) > 1 || abs(y) > 1)) continue;
+                // Pro (16-Tap): 3x3 + Outer Cardinals (Diamond)
+                if (upscale_quality == 2 && (abs(x) > 1 && abs(y) > 1)) continue;
+                // High (25-Tap): Full 5x5 - No skip
+
+                float2 offset = float2(x, y) * stride;
+                float3 samp = image.Sample(def_sampler, v_in.uv + offset).rgb;
+                
+                // --- THE DOT ELIMINATOR: Range Tracking ---
+                n_min = min(n_min, samp);
+                n_max = max(n_max, samp);
+
+                // Gaussian Bilateral Weighting
+                float w_color = exp(-abs(m_luma - getLuma(samp)) / sigma_color);
+                float dist_sq = dot(float2(x, y), float2(x, y));
+                float w_spatial = exp(-dist_sq / (2.0 * sigma_spatial * sigma_spatial));
+                
+                float weight = w_color * w_spatial;
+                acc += samp * weight;
+                total_w += weight;
+            }
+        }
+
+        // 1. Calculate the raw smooth surface
+        float3 smooth_surface = acc / total_w;
+
+        // 2. APPLY THE CLAMP (Anti-Dot Shield)
+        // This ensures the upscale never 'creates' a pixel brighter/darker than its neighbors
+        smooth_surface = clamp(smooth_surface, n_min, n_max);
+
+        // 3. CUMULATIVE DELTA
+        float3 upscale_diff = smooth_surface - image.Sample(def_sampler, v_in.uv).rgb;
+        processed_rgb = saturate(current_work + (upscale_diff * saturate(upscale_smoothness * 0.5)));
+    }
+
+    // --- DEBUG ---
+    if (debug_mode == 1) return float4(abs(processed_rgb - pre_scale_rgb) * 20.0, 1.0);
+
+    return float4(processed_rgb, raw_center.a);
+}
+
+technique Draw {
+    pass { vertex_shader = VSDefault(v_in); pixel_shader = PS_Scaling(v_in); }
+}

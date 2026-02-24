@@ -1,0 +1,131 @@
+// --- Studio Smooth Gradation (Deband) ---
+
+// Pipeline: Smoothing (Bilateral/Poisson/Morphological) -> Edge Sharpening
+
+// --- OBS UNIFORMS ---
+uniform float4x4 ViewProj;
+uniform texture2d image;
+uniform float elapsed_time;
+uniform float2 uv_pixel_interval;
+
+uniform string info_smooth<
+    string name = " ";
+    string widget_type = "info";
+> = "SMOOTH GRADATION ENGINE";
+
+// --- GROUP 1: SMOOTH GRADATION ---
+uniform bool enable_smoothing <
+    string name = "Enable Smoothing";
+> = true;
+
+uniform int smooth_algo <
+    string name = "  Smoothing Algorithm";
+    string widget_type = "select";
+    int option_0_value = 0; string option_0_label = "Bilateral (Surface Edge)";
+    int option_1_value = 1; string option_1_label = "Poisson Spiral (Reconstruction)";
+    int option_2_value = 2; string option_2_label = "Morphological (Edge-Aware)";
+> = 1;
+
+uniform int smooth_taps <
+    string name = "  Sample Count (Taps)";
+    string widget_type = "select";
+    int option_0_value = 4;   string option_0_label = "4 Taps (Low)";
+    int option_1_value = 16;  string option_1_label = "16 Taps (Medium)";
+    int option_2_value = 24;  string option_2_label = "24 Taps (Balanced)";
+    int option_3_value = 32;  string option_3_label = "32 Taps (High)";
+    int option_4_value = 64;  string option_4_label = "64 Taps (Extreme)";
+> = 32;
+
+uniform float smoothness <
+    string name = "  Smoothing Radius";
+    float minimum = 0.0; float maximum = 20.0; float step = 0.1;
+> = 2.5;
+
+uniform float edge_protection <
+    string name = "  Detail Preservation";
+    float minimum = 0.001; float maximum = 0.1; float step = 0.001;
+> = 0.015;
+
+uniform float edge_sharpen <
+    string name = "  Edge Sharpening (Post-Process)";
+    float minimum = 0.0; float maximum = 2.0; float step = 0.05;
+> = 0.2;
+
+uniform string divider_line<
+    string name = " ";
+    string widget_type = "info";
+> = "";
+
+// --- DIAGNOSTICS ---
+uniform int debug_mode <
+    string name = "Debug View";
+    string widget_type = "select";
+    int option_0_value = 0; string option_0_label = "Off (Final Output)";
+    int option_1_value = 1; string option_1_label = "Show Difference (Mask)";
+> = 0;
+
+// --- INTERNALS ---
+sampler_state def_sampler { Filter = Linear; AddressU = Clamp; AddressV = Clamp; };
+struct VertData { float4 pos : POSITION; float2 uv : TEXCOORD0; };
+
+VertData VSDefault(VertData v_in) {
+    VertData v_out; v_out.pos = mul(float4(v_in.pos.xyz, 1.0), ViewProj); v_out.uv  = v_in.uv; return v_out;
+}
+
+float getLuma(float3 rgb) { return dot(rgb, float3(0.299, 0.587, 0.114)); }
+
+float4 PS_SmoothGradation(VertData v_in) : TARGET {
+    float4 raw_center = image.Sample(def_sampler, v_in.uv);
+    float3 processed_rgb = raw_center.rgb;
+    float3 pre_smooth_rgb = raw_center.rgb; 
+
+    // --- SMOOTH GRADATION LOGIC ---
+    if (enable_smoothing && smoothness > 0.0) {
+        float3 smooth_acc = processed_rgb;
+        float total_weight = 1.0;
+        float center_luma = getLuma(processed_rgb);
+        
+        for(int i=0; i < smooth_taps; i++) {
+            float t = (float)i / (float)smooth_taps;
+            float angle, radius;
+            
+            // Algorithm Selection
+            if (smooth_algo == 1) { 
+                // Poisson Spiral
+                angle = i * 2.399963229 + elapsed_time; 
+                radius = sqrt(t) * smoothness; 
+            } else { 
+                // Radial / Standard Bilateral
+                angle = (float)i * (6.28318 / (float)smooth_taps); 
+                radius = smoothness; 
+            }
+
+            float2 tap_uv = v_in.uv + (float2(cos(angle), sin(angle)) * uv_pixel_interval * radius);
+            float3 tap_rgb = image.Sample(def_sampler, tap_uv).rgb;
+            
+            // Weight Calculation
+            float weight = saturate(1.0 - abs(center_luma - getLuma(tap_rgb)) / edge_protection);
+            
+            // Morphological modifier
+            if (smooth_algo == 2) weight *= (1.0 - saturate(abs(center_luma - getLuma(tap_rgb)) * 100.0));
+
+            smooth_acc += tap_rgb * weight;
+            total_weight += weight;
+        }
+        processed_rgb = smooth_acc / total_weight;
+
+        // Post-Process Sharpening
+        if (edge_sharpen > 0.0) {
+            processed_rgb = processed_rgb + (processed_rgb - pre_smooth_rgb) * -edge_sharpen;
+        }
+    }
+
+    // --- DEBUG ---
+    if (debug_mode == 1) return float4(abs(processed_rgb - pre_smooth_rgb) * 30.0, 1.0);
+
+    return float4(processed_rgb, raw_center.a);
+}
+
+technique Draw {
+    pass { vertex_shader = VSDefault(v_in); pixel_shader = PS_SmoothGradation(v_in); }
+}
